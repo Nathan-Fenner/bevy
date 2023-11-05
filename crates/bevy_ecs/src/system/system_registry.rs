@@ -6,10 +6,14 @@ use bevy_ecs_macros::Component;
 use thiserror::Error;
 
 /// A small wrapper for [`BoxedSystem`] that also keeps track whether or not the system has been initialized.
+///
+/// The `I` generic parameter is the "input" type for the system, if it takes an [`crate::system::In`] parameter.
+///
+/// The `O` generic parameter is the output type for the system.
 #[derive(Component)]
-struct RegisteredSystem {
-    initialized: bool,
-    system: BoxedSystem,
+pub(crate) struct RegisteredSystem<I = (), O = ()> {
+    pub(crate) initialized: bool,
+    pub(crate) system: BoxedSystem<I, O>,
 }
 
 /// A system that has been removed from the registry.
@@ -38,8 +42,30 @@ impl RemovedSystem {
 ///
 /// These are opaque identifiers, keyed to a specific [`World`],
 /// and are created via [`World::register_system`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SystemId(Entity);
+#[derive(PartialEq, Eq, Hash)]
+pub struct SystemId<I = (), O = ()>(
+    pub(crate) Entity,
+    pub(crate) std::marker::PhantomData<fn(I) -> O>,
+);
+
+// The default bounds on the derived `Clone` for `SystemId` would require that `I: Clone` as well.
+// Therefore, a custom impl is provided instead.
+impl<I, O> Clone for SystemId<I, O> {
+    fn clone(&self) -> Self {
+        Self(self.0, self.1)
+    }
+}
+
+impl<I, O> std::fmt::Debug for SystemId<I, O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The PhantomData is deliberately omitted to simplify the debug string.
+        f.debug_tuple("SystemId").field(&self.0).finish()
+    }
+}
+
+// The default bounds on the derived `Copy` for `SystemId` would require that `I: Copy` as well.
+// Therefore, a custom impl is provided instead.
+impl<I, O> Copy for SystemId<I, O> {}
 
 impl World {
     /// Registers a system and returns a [`SystemId`] so it can later be called by [`World::run_system`].
@@ -51,16 +77,19 @@ impl World {
     /// This allows for running systems in a pushed-based fashion.
     /// Using a [`Schedule`](crate::schedule::Schedule) is still preferred for most cases
     /// due to its better performance and abillity to run non-conflicting systems simultaneously.
-    pub fn register_system<M, S: IntoSystem<(), (), M> + 'static>(
+    ///
+    /// If the system takes an input parameter, this is reflected in the return type as `SystemId<I>`.
+    pub fn register_system<M, I: 'static, O: 'static, S: IntoSystem<I, O, M> + 'static>(
         &mut self,
         system: S,
-    ) -> SystemId {
+    ) -> SystemId<I, O> {
         SystemId(
             self.spawn(RegisteredSystem {
                 initialized: false,
                 system: Box::new(IntoSystem::into_system(system)),
             })
             .id(),
+            std::marker::PhantomData,
         )
     }
 
@@ -70,7 +99,10 @@ impl World {
     ///
     /// If no system corresponds to the given [`SystemId`], this method returns an error.
     /// Systems are also not allowed to remove themselves, this returns an error too.
-    pub fn remove_system(&mut self, id: SystemId) -> Result<RemovedSystem, RegisteredSystemError> {
+    pub fn remove_system<I, O>(
+        &mut self,
+        id: SystemId<I, O>,
+    ) -> Result<RemovedSystem, RegisteredSystemError<I, O>> {
         match self.get_entity_mut(id.0) {
             Some(mut entity) => {
                 let registered_system = entity
@@ -92,9 +124,9 @@ impl World {
     /// This is different from [`RunSystemOnce::run_system_once`](crate::system::RunSystemOnce::run_system_once),
     /// because it keeps local state between calls and change detection works correctly.
     ///
-    /// # Limitations
+    /// To call a chained system that takes an input, use [`World::run_system_with_input`] instead.
     ///
-    ///  - Stored systems cannot be chained: they can neither have an [`In`](crate::system::In) nor return any values.
+    /// # Limitations
     ///  - Stored systems cannot be recursive, they cannot call themselves through [`Commands::run_system`](crate::system::Commands).
     ///  - Exclusive systems cannot be used.
     ///
@@ -141,7 +173,43 @@ impl World {
     /// world.resource_mut::<ChangeDetector>().set_changed();
     /// let _ = world.run_system(detector); // -> Something happened!
     /// ```
-    pub fn run_system(&mut self, id: SystemId) -> Result<(), RegisteredSystemError> {
+    pub fn run_system<O: 'static>(
+        &mut self,
+        id: SystemId<(), O>,
+    ) -> Result<O, RegisteredSystemError<(), O>> {
+        self.run_system_with_input(id, ())
+    }
+
+    /// Run stored systems by their [`SystemId`].
+    /// Before running a system, it must first be registered.
+    /// The method [`World::register_system`] stores a given system and returns a [`SystemId`].
+    ///
+    /// `run_system_with_input` behaves just like [`World::run_system`], but also allows an
+    /// input value to be provided to the registered system, if it requires one.
+    ///
+    /// ```rust
+    /// # use bevy_ecs::prelude::*;
+    /// #[derive(Resource, Default)]
+    /// struct Counter(u8);
+    ///
+    /// fn increment(In(increment_by): In<u8>, mut counter: Local<Counter>) {
+    ///    counter.0 += increment_by;
+    ///    println!("{}", counter.0);
+    /// }
+    ///
+    /// let mut world = World::default();
+    /// let counter_one = world.register_system(increment);
+    /// let counter_two = world.register_system(increment);
+    /// world.run_system_with_input(counter_one, 2); // -> 2
+    /// world.run_system_with_input(counter_one, 100); // -> 102
+    /// world.run_system(counter_two, 1); // -> 103
+    /// ```
+    /// See [`World::run_system`] for more details about running stored systems.
+    pub fn run_system_with_input<Input: 'static, Output: 'static>(
+        &mut self,
+        id: SystemId<Input, Output>,
+        input_value: Input,
+    ) -> Result<Output, RegisteredSystemError<Input, Output>> {
         // lookup
         let mut entity = self
             .get_entity_mut(id.0)
@@ -152,7 +220,7 @@ impl World {
             mut initialized,
             mut system,
         } = entity
-            .take::<RegisteredSystem>()
+            .take::<RegisteredSystem<Input, Output>>()
             .ok_or(RegisteredSystemError::Recursive(id))?;
 
         // run the system
@@ -160,17 +228,17 @@ impl World {
             system.initialize(self);
             initialized = true;
         }
-        system.run((), self);
+        let output_value = system.run(input_value, self);
         system.apply_deferred(self);
 
         // return ownership of system trait object (if entity still exists)
         if let Some(mut entity) = self.get_entity_mut(id.0) {
-            entity.insert::<RegisteredSystem>(RegisteredSystem {
+            entity.insert::<RegisteredSystem<Input, Output>>(RegisteredSystem {
                 initialized,
                 system,
             });
         }
-        Ok(())
+        Ok(output_value)
     }
 }
 
@@ -198,19 +266,31 @@ impl Command for RunSystem {
 }
 
 /// An operation with stored systems failed.
-#[derive(Debug, Error)]
-pub enum RegisteredSystemError {
+#[derive(Error)]
+pub enum RegisteredSystemError<I = (), O = ()> {
     /// A system was run by id, but no system with that id was found.
     ///
     /// Did you forget to register it?
     #[error("System {0:?} was not registered")]
-    SystemIdNotRegistered(SystemId),
+    SystemIdNotRegistered(SystemId<I, O>),
     /// A system tried to run itself recursively.
     #[error("System {0:?} tried to run itself recursively")]
-    Recursive(SystemId),
+    Recursive(SystemId<I, O>),
     /// A system tried to remove itself.
     #[error("System {0:?} tried to remove itself")]
-    SelfRemove(SystemId),
+    SelfRemove(SystemId<I, O>),
+}
+
+impl<I, O> std::fmt::Debug for RegisteredSystemError<I, O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SystemIdNotRegistered(id) => {
+                f.debug_tuple("SystemIdNotRegistered").field(id).finish()
+            }
+            Self::Recursive(id) => f.debug_tuple("Recursive").field(id).finish(),
+            Self::SelfRemove(id) => f.debug_tuple("SelfRemove").field(id).finish(),
+        }
+    }
 }
 
 mod tests {
@@ -248,6 +328,130 @@ mod tests {
         // Making a change
         world.resource_mut::<ChangeDetector>().set_changed();
         let _ = world.run_system(id);
+        assert_eq!(*world.resource::<Counter>(), Counter(2));
+    }
+
+    #[test]
+    fn one_shot_system_with_input() {
+        #[derive(Resource, Default, Eq, PartialEq, Debug)]
+        struct Counter(i32);
+
+        // Demonstration that we can pass in non-Copy, non-Clone types.
+        struct NonCopyInt(i32);
+
+        fn count_up_by(increment_by: In<NonCopyInt>, mut counter: ResMut<Counter>) {
+            counter.0 += increment_by.0 .0;
+        }
+
+        let mut world = World::new();
+        world.init_resource::<Counter>();
+
+        let id = world.register_system(count_up_by);
+
+        // Increase by 5
+        world
+            .run_system_with_input(id, NonCopyInt(5))
+            .expect("no error from running system");
+        assert_eq!(*world.resource::<Counter>(), Counter(5));
+
+        // Increase by 100
+        world
+            .run_system_with_input(id, NonCopyInt(100))
+            .expect("no error from running system");
+        assert_eq!(*world.resource::<Counter>(), Counter(105));
+    }
+
+    #[test]
+    fn one_shot_system_with_output() {
+        #[derive(Resource, Default, Eq, PartialEq, Debug)]
+        struct Counter(i32);
+
+        // Demonstration that we can return non-Copy, non-Clone types.
+        #[derive(Eq, PartialEq, Debug)]
+        struct NonCopyInt(i32);
+
+        fn count_up(mut counter: ResMut<Counter>) -> NonCopyInt {
+            counter.0 += 1;
+            NonCopyInt(counter.0)
+        }
+
+        let mut world = World::new();
+        world.init_resource::<Counter>();
+
+        let id = world.register_system(count_up);
+
+        // Increase by 1
+        let out = world.run_system(id).expect("no error from running system");
+        assert_eq!(*world.resource::<Counter>(), Counter(1));
+        assert_eq!(out, NonCopyInt(1));
+
+        // Increase by 1 again
+        let _ = world.run_system(id);
+        assert_eq!(*world.resource::<Counter>(), Counter(15));
+    }
+
+    #[test]
+    fn creating_system_from_commands() {
+        #[derive(Resource, Default, Eq, PartialEq, Debug)]
+        struct Counter(i32);
+
+        fn count_up(mut counter: ResMut<Counter>) {
+            counter.0 += 1;
+        }
+
+        fn sys_that_registers_sys(mut commands: Commands) -> bevy_ecs::system::SystemId {
+            commands.register_system(count_up)
+        }
+
+        let mut world = World::new();
+
+        let meta_register_sys_id = world.register_system(sys_that_registers_sys);
+        let count_sys_id = world
+            .run_system(meta_register_sys_id)
+            .expect("no system error");
+
+        // After the system has been registered, create its required resource.
+        world.init_resource::<Counter>();
+        assert_eq!(*world.resource::<Counter>(), Counter(0));
+
+        // Increase by 1
+        world.run_system(count_sys_id).expect("no system error");
+        assert_eq!(*world.resource::<Counter>(), Counter(1));
+
+        // Increase by 1 again
+        world.run_system(count_sys_id).expect("no system error");
+        assert_eq!(*world.resource::<Counter>(), Counter(2));
+
+        // Increase by 1 again
+        world.run_system(count_sys_id).expect("no system error");
+        assert_eq!(*world.resource::<Counter>(), Counter(3));
+    }
+
+    #[test]
+    fn one_shot_with_lazily_initialized_state() {
+        #[derive(Resource, Default, Eq, PartialEq, Debug)]
+        struct Counter(i32);
+
+        // Demonstration that we can return non-Copy, non-Clone types.
+        #[derive(Eq, PartialEq, Debug)]
+        struct NonCopyInt(i32);
+
+        fn count_up(mut counter: ResMut<Counter>) {
+            counter.0 += 1;
+        }
+
+        let mut world = World::new();
+
+        let id = world.register_system(count_up);
+
+        world.init_resource::<Counter>();
+
+        // Increase by 1
+        world.run_system(id).expect("no error from running system");
+        assert_eq!(*world.resource::<Counter>(), Counter(1));
+
+        // Increase by 1 again
+        world.run_system(id).expect("no error from running system");
         assert_eq!(*world.resource::<Counter>(), Counter(2));
     }
 

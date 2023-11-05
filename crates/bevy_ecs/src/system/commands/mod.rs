@@ -269,6 +269,32 @@ impl<'w, 's> Commands<'w, 's> {
         e
     }
 
+    /// Registers a system and returns a [`SystemId`] so it can later be called by [`World::run_system`].
+    /// This method can be called instead of [`World::register_system`].
+    ///
+    /// It's possible to register the same systems more than once, they'll be stored separately.
+    ///
+    /// This is different from adding systems to a [`Schedule`](crate::schedule::Schedule),
+    /// because the [`SystemId`] that is returned can be used anywhere in the [`World`] to run the associated system.
+    /// This allows for running systems in a pushed-based fashion.
+    /// Using a [`Schedule`](crate::schedule::Schedule) is still preferred for most cases
+    /// due to its better performance and abillity to run non-conflicting systems simultaneously.
+    ///
+    /// If the system takes an input parameter, this is reflected in the return type as `SystemId<I>`.
+    pub fn register_system<M, I: 'static, O: 'static, S: super::IntoSystem<I, O, M> + 'static>(
+        &mut self,
+        system: S,
+    ) -> SystemId<I, O> {
+        SystemId(
+            self.spawn(super::RegisteredSystem {
+                initialized: false,
+                system: Box::new(super::IntoSystem::into_system(system)),
+            })
+            .id(),
+            std::marker::PhantomData,
+        )
+    }
+
     /// Returns the [`EntityCommands`] for the requested [`Entity`].
     ///
     /// # Panics
